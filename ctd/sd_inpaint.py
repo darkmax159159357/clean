@@ -65,16 +65,19 @@ SD_NUM_STEPS = int(os.environ.get("SD_NUM_STEPS", "28"))
 SD_GUIDANCE = float(os.environ.get("SD_GUIDANCE", "3.5"))
 SD_STRENGTH = float(os.environ.get("SD_STRENGTH", "0.55"))
 
-# Positive prompt: describe ONLY the surface/background that should fill the
-# masked area. SD treats the prompt as "what to put here", so we tell it to
-# continue the existing artwork with no new content. Keep it short — long
-# prompts dilute the signal.
+# Positive prompt: a single coherent sentence describing what should be in the
+# masked area. SD 1.5 is NOT an instruction-following model (it cannot obey
+# "remove the text" — that requires InstructPix2Pix). We instead describe the
+# scene we want: an empty, clean continuation of the surrounding manga art
+# where the speech bubble used to hold dialogue. Written as natural prose so
+# the text encoder reads a unified scene rather than disconnected tags.
 SD_PROMPT = os.environ.get(
     "SD_PROMPT",
-    "clean manga panel background, seamless continuation of the surrounding "
-    "artwork, screentone dots, ink line art, halftone shading, monochrome "
-    "manga illustration, plain empty area, untouched background, "
-    "professional manga page, high detail, sharp lines"
+    "an empty manga speech bubble with a clean blank interior where the "
+    "dialogue text used to be, the surrounding screentone shading, ink line "
+    "art and halftone dots continuing smoothly into the area, monochrome "
+    "black and white manga page, professional published manga illustration, "
+    "sharp inked lines, untouched original artwork"
 ).strip()
 
 # Negative prompt: aggressively forbid everything that would qualify as
