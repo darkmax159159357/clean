@@ -72,7 +72,7 @@ def get_lama():
 
 
 CHUNK_MAX_HEIGHT = 2000
-INPAINT_MAX_SIZE = 1024
+INPAINT_MAX_SIZE = 2048
 
 
 def _pad_to_multiple(val, multiple):
@@ -113,7 +113,7 @@ def lama_inpaint_gpu(image_bgr, mask_gray):
     model = get_lama()
     orig_h, orig_w = image_bgr.shape[:2]
 
-    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     expanded_mask = cv2.dilate(mask_gray, dilate_kernel, iterations=2)
 
     if max(orig_h, orig_w) <= INPAINT_MAX_SIZE:
