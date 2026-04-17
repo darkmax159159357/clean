@@ -111,6 +111,58 @@ def _run_lama_gpu(model, img_bgr, msk):
     return result
 
 
+def _gradient_blend_gpu(result_bgr, image_bgr, mask_u8):
+    """Per-component smooth blend that NEVER reads in-mask (text) pixels.
+
+    For components whose surrounding ring shows a real color gradient, replace
+    LaMa's flat patch with: cv2.inpaint(NS) of the original (interpolated from
+    pixels OUTSIDE the dilated mask only) plus LaMa's residual high-frequency
+    texture. For uniform/plain bubbles, keep LaMa output as-is."""
+    H, W = image_bgr.shape[:2]
+    final = image_bgr.copy()
+    bin_mask = (mask_u8 > 127).astype(np.uint8) * 255
+    if bin_mask.sum() == 0:
+        return final
+    bg_field = cv2.inpaint(image_bgr, bin_mask, 5, cv2.INPAINT_NS)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
+    pad = 8
+    for i in range(1, num):
+        x, y, w, h, area = stats[i]
+        ys_all, xs_all = np.where(labels == i)
+        if area < 32:
+            final[ys_all, xs_all] = result_bgr[ys_all, xs_all]
+            continue
+        x0 = max(0, x - pad); y0 = max(0, y - pad)
+        x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
+        comp_mask = ((labels[y0:y1, x0:x1] == i).astype(np.uint8)) * 255
+        if comp_mask.shape[0] < 4 or comp_mask.shape[1] < 4:
+            final[ys_all, xs_all] = result_bgr[ys_all, xs_all]
+            continue
+        ring_outer = cv2.dilate(comp_mask, np.ones((9, 9), np.uint8))
+        ring_inner = cv2.dilate(comp_mask, np.ones((3, 3), np.uint8))
+        ring = (ring_outer > 0) & (ring_inner == 0)
+        roi_orig = image_bgr[y0:y1, x0:x1]
+        if ring.sum() < 20:
+            final[ys_all, xs_all] = result_bgr[ys_all, xs_all]
+            continue
+        ring_std = float(roi_orig[ring].astype(np.float32).std(axis=0).mean())
+        if ring_std < 8.0:
+            final[ys_all, xs_all] = result_bgr[ys_all, xs_all]
+            continue
+        roi_lama = result_bgr[y0:y1, x0:x1].astype(np.float32)
+        roi_bg = bg_field[y0:y1, x0:x1].astype(np.float32)
+        size = max(w, h)
+        sigma = max(3.0, size / 4.0)
+        k = int(sigma * 4) | 1
+        k = max(3, min(k, 51))
+        lama_low = cv2.GaussianBlur(roi_lama, (k, k), sigma)
+        merged = roi_bg + (roi_lama - lama_low)
+        merged = np.clip(merged, 0, 255).astype(np.uint8)
+        sel = comp_mask > 0
+        final[y0:y1, x0:x1][sel] = merged[sel]
+    return final
+
+
 def lama_inpaint_gpu(image_bgr, mask_gray):
     model = get_lama()
     orig_h, orig_w = image_bgr.shape[:2]
@@ -127,13 +179,15 @@ def lama_inpaint_gpu(image_bgr, mask_gray):
         small_result = _run_lama_gpu(model, small_img, small_mask)
         result = cv2.resize(small_result, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
 
+    blended = _gradient_blend_gpu(result, image_bgr, expanded_mask)
+
     feather_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    feather = cv2.dilate(expanded_mask, feather_kernel, iterations=2)
+    feather = cv2.dilate(expanded_mask, feather_kernel, iterations=1)
     feather = cv2.GaussianBlur(feather, (11, 11), 3.0)
     feather_f = feather.astype(np.float32) / 255.0
     mask_3 = np.stack([feather_f] * 3, axis=-1)
 
-    final = (result * mask_3 + image_bgr * (1 - mask_3)).astype(np.uint8)
+    final = (blended * mask_3 + image_bgr * (1 - mask_3)).astype(np.uint8)
     return final
 
 
