@@ -96,7 +96,15 @@ def get_sd_pipeline(device: str = 'cuda'):
         except Exception:
             pass
         _sd_pipe.set_progress_bar_config(disable=True)
-        logger.info(f"SD inpaint pipeline loaded on {device} (dtype={dtype})")
+
+        _sd_pipe.safety_checker = None
+        _sd_pipe.requires_safety_checker = False
+        try:
+            _sd_pipe.run_safety_checker = lambda image, device, dtype: (image, [False] * len(image))
+        except Exception:
+            pass
+
+        logger.info(f"SD inpaint pipeline loaded on {device} (dtype={dtype}) — safety checker disabled")
     return _sd_pipe
 
 
