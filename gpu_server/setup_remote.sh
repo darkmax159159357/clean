@@ -1,62 +1,53 @@
 #!/usr/bin/env bash
 # One-shot remote setup for the GPU server on vast.ai.
-# Usage on vast.ai (after pasting TOKEN):
-#   TOKEN="<your_token>"
-#   BASE="https://174ca3b9-d088-4b34-aeb0-dbc9976fa8aa-00-u5olo7fa1zd.worf.replit.dev/gpu_bootstrap/$TOKEN"
-#   wget -qO /tmp/setup.sh "$BASE/gpu_server/setup_remote.sh" && bash /tmp/setup.sh "$TOKEN"
+# Pulls the latest code from GitHub: https://github.com/darkmax159159357/clean
+#
+# Usage on vast.ai:
+#   wget -qO /tmp/setup.sh https://raw.githubusercontent.com/darkmax159159357/clean/main/gpu_server/setup_remote.sh
+#   bash /tmp/setup.sh
 
 set -e
 
-TOKEN="${1:-${GPU_ADMIN_TOKEN:-}}"
-if [ -z "$TOKEN" ]; then
-  echo "❌ Missing token. Usage: bash setup_remote.sh <TOKEN>"
-  exit 1
-fi
-
-BASE_URL="${REPLIT_BASE_URL:-https://174ca3b9-d088-4b34-aeb0-dbc9976fa8aa-00-u5olo7fa1zd.worf.replit.dev}"
-BOOT="$BASE_URL/gpu_bootstrap/$TOKEN"
-
+REPO_URL="${REPO_URL:-https://github.com/darkmax159159357/clean.git}"
+BRANCH="${BRANCH:-main}"
+REPO_DIR="${REPO_DIR:-/workspace/lala-repo}"
 WORKDIR="${WORKDIR:-/workspace/gpu_server}"
 CTDDIR="${CTDDIR:-/workspace/ctd}"
 
 echo "=============================================="
-echo "🚀 LALA GPU Server — Remote Setup"
+echo "🚀 LALA GPU Server — Remote Setup (git)"
 echo "=============================================="
-echo "Base URL : $BASE_URL"
-echo "Workdir  : $WORKDIR"
+echo "Repo    : $REPO_URL ($BRANCH)"
+echo "Repo dir: $REPO_DIR"
+echo "Workdir : $WORKDIR"
 echo ""
 
-mkdir -p "$WORKDIR" "$CTDDIR" /workspace/models/sd-inpaint
+mkdir -p "$WORKDIR" "$CTDDIR" /workspace/models/sd-inpaint /workspace/models
 
-fetch() {
-  local rel="$1"
-  local dst="$2"
-  echo "⬇️  $rel → $dst"
-  if ! wget -q --show-progress -O "$dst.tmp" "$BOOT/$rel"; then
-    echo "❌ Failed to download $rel"
-    rm -f "$dst.tmp"
-    exit 1
-  fi
-  # Guard against auth/404 HTML/JSON errors served with 200 by reverse proxy
-  if head -c 200 "$dst.tmp" | grep -q '"error"'; then
-    echo "❌ Server returned error for $rel:"
-    cat "$dst.tmp"
-    rm -f "$dst.tmp"
-    exit 1
-  fi
-  mv "$dst.tmp" "$dst"
-}
+echo "=== 1/4 Syncing code from GitHub ==="
+if [ -d "$REPO_DIR/.git" ]; then
+  echo "↻ Updating existing clone…"
+  git -C "$REPO_DIR" fetch --depth 1 origin "$BRANCH"
+  git -C "$REPO_DIR" reset --hard "origin/$BRANCH"
+  git -C "$REPO_DIR" clean -fd
+else
+  echo "⬇️  Cloning $REPO_URL…"
+  rm -rf "$REPO_DIR"
+  git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$REPO_DIR"
+fi
 
-echo "=== 1/4 Syncing code from Replit ==="
-fetch "gpu_server/server.py"            "$WORKDIR/server.py"
-fetch "gpu_server/requirements.txt"     "$WORKDIR/requirements.txt"
-fetch "ctd/__init__.py"                 "$CTDDIR/__init__.py"
-fetch "ctd/ctd_onnx_detector.py"        "$CTDDIR/ctd_onnx_detector.py"
-fetch "ctd/lama_inpaint.py"             "$CTDDIR/lama_inpaint.py"
-fetch "ctd/sd_inpaint.py"               "$CTDDIR/sd_inpaint.py"
-fetch "ctd/easyocr_enhancer.py"         "$CTDDIR/easyocr_enhancer.py"
-# Remove obsolete files from previous deployments
+echo "📋 Copying gpu_server/ → $WORKDIR"
+cp -f "$REPO_DIR/gpu_server/server.py"        "$WORKDIR/server.py"
+cp -f "$REPO_DIR/gpu_server/requirements.txt" "$WORKDIR/requirements.txt"
+
+echo "📋 Copying ctd/ → $CTDDIR"
+# Wipe stale modules from previous deployments
 rm -f "$CTDDIR/detector.py" "$CTDDIR/smart_clean.py"
+cp -f "$REPO_DIR/ctd/__init__.py"           "$CTDDIR/__init__.py"
+cp -f "$REPO_DIR/ctd/ctd_onnx_detector.py"  "$CTDDIR/ctd_onnx_detector.py"
+cp -f "$REPO_DIR/ctd/lama_inpaint.py"       "$CTDDIR/lama_inpaint.py"
+cp -f "$REPO_DIR/ctd/sd_inpaint.py"         "$CTDDIR/sd_inpaint.py"
+cp -f "$REPO_DIR/ctd/easyocr_enhancer.py"   "$CTDDIR/easyocr_enhancer.py"
 
 echo ""
 echo "=== 2/4 Installing Python dependencies ==="
@@ -68,7 +59,6 @@ pkill -f "python.*server.py" 2>/dev/null || true
 sleep 2
 
 cd "$WORKDIR"
-# Start in background with nohup so SSH disconnect doesn't kill it
 mkdir -p /workspace/logs
 PORT="${SERVER_PORT:-7860}"
 nohup python server.py --port "$PORT" > /workspace/logs/server.log 2>&1 &
@@ -78,7 +68,6 @@ echo "✅ server.py started (PID=$SERVER_PID), logs → /workspace/logs/server.l
 sleep 5
 echo ""
 echo "=== 4/4 Health check ==="
-PORT="${SERVER_PORT:-7860}"
 for i in 1 2 3 4 5 6; do
   if curl -sf "http://localhost:$PORT/health" > /tmp/health.json; then
     echo "✅ Server is healthy:"
@@ -97,5 +86,5 @@ echo "=============================================="
 echo "Tail logs:   tail -f /workspace/logs/server.log"
 echo "Stop server: pkill -f 'python.*server.py'"
 echo ""
-echo "ℹ️  SD model will auto-download (~4GB) to"
-echo "   /workspace/models/sd-inpaint/ on first /clean engine:sd call."
+echo "ℹ️  comictextdetector.pt.onnx auto-downloads (~75MB) on first /clean call."
+echo "ℹ️  SD model auto-downloads (~4GB) on first engine=sd call."
