@@ -61,16 +61,45 @@ def _ensure_sd_checkpoint() -> str:
 
 
 SD_TRAIN_RES = 512
-SD_NUM_STEPS = 30
-SD_GUIDANCE = 1.5
-SD_PROMPT = "seamless background continuation, empty, plain, smooth, uniform"
-SD_NEG_PROMPT = (
-    "person, people, character, man, woman, boy, girl, child, "
-    "face, eyes, mouth, nose, ears, hair, hands, fingers, body, figure, silhouette, "
-    "anime character, manga character, portrait, drawing of a person, "
-    "text, letters, words, writing, speech bubble, watermark, logo, signature, "
-    "new objects, new content, decoration, pattern, blurry, low quality, artifacts"
-)
+SD_NUM_STEPS = int(os.environ.get("SD_NUM_STEPS", "28"))
+SD_GUIDANCE = float(os.environ.get("SD_GUIDANCE", "3.5"))
+SD_STRENGTH = float(os.environ.get("SD_STRENGTH", "0.55"))
+
+# Positive prompt: describe ONLY the surface/background that should fill the
+# masked area. SD treats the prompt as "what to put here", so we tell it to
+# continue the existing artwork with no new content. Keep it short — long
+# prompts dilute the signal.
+SD_PROMPT = os.environ.get(
+    "SD_PROMPT",
+    "clean manga panel background, seamless continuation of the surrounding "
+    "artwork, screentone dots, ink line art, halftone shading, monochrome "
+    "manga illustration, plain empty area, untouched background, "
+    "professional manga page, high detail, sharp lines"
+).strip()
+
+# Negative prompt: aggressively forbid everything that would qualify as
+# "added content". SD 1.5 ignores standalone negations like "no text" inside
+# the positive prompt, but takes negative_prompt seriously.
+SD_NEG_PROMPT = os.environ.get(
+    "SD_NEG_PROMPT",
+    # text artifacts (the whole point of the cleaner)
+    "text, letters, characters, kanji, hiragana, katakana, hangul, chinese, "
+    "japanese text, korean text, words, writing, calligraphy, typography, "
+    "font, caption, subtitle, label, logo, watermark, signature, stamp, "
+    "speech bubble, dialogue, sound effect, sfx, onomatopoeia, "
+    # invented content
+    "new character, additional character, extra person, person, people, "
+    "face, eyes, mouth, hand, finger, hair, body, figure, silhouette, "
+    "creature, animal, monster, object, item, weapon, building, vehicle, "
+    "plant, flower, tree, "
+    # quality
+    "blurry, smudged, smear, low quality, jpeg artifacts, compression "
+    "artifacts, noise, grain, distortion, deformed, ghosting, double image, "
+    "color bleed, oversaturated, washed out, halo, glow, "
+    # style drift
+    "photo, photograph, photorealistic, 3d render, painting, oil painting, "
+    "watercolor, color illustration, colored, full color"
+).strip()
 
 _sd_pipe = None
 
@@ -128,8 +157,8 @@ def sd_inpaint(image_bgr: np.ndarray, mask_gray: np.ndarray,
     pipe = get_sd_pipeline(device)
     orig_h, orig_w = image_bgr.shape[:2]
 
-    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    expanded_mask = cv2.dilate(mask_gray, dilate_kernel, iterations=2)
+    dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    expanded_mask = cv2.dilate(mask_gray, dilate_kernel, iterations=3)
 
     new_h, new_w = _compute_sd_size(orig_h, orig_w)
     img_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -147,6 +176,7 @@ def sd_inpaint(image_bgr: np.ndarray, mask_gray: np.ndarray,
         mask_image=mask_pil,
         num_inference_steps=SD_NUM_STEPS,
         guidance_scale=SD_GUIDANCE,
+        strength=SD_STRENGTH,
         height=new_h,
         width=new_w,
     ).images[0]
@@ -157,7 +187,7 @@ def sd_inpaint(image_bgr: np.ndarray, mask_gray: np.ndarray,
         out_bgr = cv2.resize(out_bgr, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
 
     feather_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    feather = cv2.dilate(expanded_mask, feather_kernel, iterations=2)
+    feather = cv2.dilate(expanded_mask, feather_kernel, iterations=1)
     feather = cv2.GaussianBlur(feather, (11, 11), 3.0)
     feather_f = feather.astype(np.float32) / 255.0
     mask_3 = np.stack([feather_f] * 3, axis=-1)
