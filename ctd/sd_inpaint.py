@@ -65,44 +65,14 @@ SD_NUM_STEPS = int(os.environ.get("SD_NUM_STEPS", "28"))
 SD_GUIDANCE = float(os.environ.get("SD_GUIDANCE", "3.5"))
 SD_STRENGTH = float(os.environ.get("SD_STRENGTH", "0.55"))
 
-# Positive prompt: a single coherent sentence describing what should be in the
-# masked area. SD 1.5 is NOT an instruction-following model (it cannot obey
-# "remove the text" — that requires InstructPix2Pix). We instead describe the
-# scene we want: an empty, clean continuation of the surrounding manga art
-# where the speech bubble used to hold dialogue. Written as natural prose so
-# the text encoder reads a unified scene rather than disconnected tags.
-SD_PROMPT = os.environ.get(
-    "SD_PROMPT",
-    "an empty manga speech bubble with a clean blank interior where the "
-    "dialogue text used to be, the surrounding screentone shading, ink line "
-    "art and halftone dots continuing smoothly into the area, monochrome "
-    "black and white manga page, professional published manga illustration, "
-    "sharp inked lines, untouched original artwork"
-).strip()
+# Prompts now live in prompts/sd_inpaint_prompt.py with full documentation,
+# adaptive selection (bubble interior vs over-artwork, mono vs color), and a
+# tightly-tuned negative prompt. SD_PROMPT / SD_NEG_PROMPT env vars override
+# the auto-selected prompt for experimentation.
+from prompts.sd_inpaint_prompt import build_inpaint_prompt, NEG_PROMPT as _DEFAULT_NEG
 
-# Negative prompt: aggressively forbid everything that would qualify as
-# "added content". SD 1.5 ignores standalone negations like "no text" inside
-# the positive prompt, but takes negative_prompt seriously.
-SD_NEG_PROMPT = os.environ.get(
-    "SD_NEG_PROMPT",
-    # text artifacts (the whole point of the cleaner)
-    "text, letters, characters, kanji, hiragana, katakana, hangul, chinese, "
-    "japanese text, korean text, words, writing, calligraphy, typography, "
-    "font, caption, subtitle, label, logo, watermark, signature, stamp, "
-    "speech bubble, dialogue, sound effect, sfx, onomatopoeia, "
-    # invented content
-    "new character, additional character, extra person, person, people, "
-    "face, eyes, mouth, hand, finger, hair, body, figure, silhouette, "
-    "creature, animal, monster, object, item, weapon, building, vehicle, "
-    "plant, flower, tree, "
-    # quality
-    "blurry, smudged, smear, low quality, jpeg artifacts, compression "
-    "artifacts, noise, grain, distortion, deformed, ghosting, double image, "
-    "color bleed, oversaturated, washed out, halo, glow, "
-    # style drift
-    "photo, photograph, photorealistic, 3d render, painting, oil painting, "
-    "watercolor, color illustration, colored, full color"
-).strip()
+SD_PROMPT_OVERRIDE = os.environ.get("SD_PROMPT", "").strip() or None
+SD_NEG_PROMPT = (os.environ.get("SD_NEG_PROMPT", "").strip() or _DEFAULT_NEG)
 
 _sd_pipe = None
 
@@ -172,8 +142,14 @@ def sd_inpaint(image_bgr: np.ndarray, mask_gray: np.ndarray,
     img_pil = Image.fromarray(img_small)
     mask_pil = Image.fromarray(mask_small)
 
+    if SD_PROMPT_OVERRIDE:
+        positive = SD_PROMPT_OVERRIDE
+    else:
+        positive, _ = build_inpaint_prompt(image_bgr, expanded_mask)
+    logger.debug(f"SD prompt: {positive[:80]}…")
+
     out = pipe(
-        prompt=SD_PROMPT,
+        prompt=positive,
         negative_prompt=SD_NEG_PROMPT,
         image=img_pil,
         mask_image=mask_pil,
