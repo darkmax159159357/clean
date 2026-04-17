@@ -61,6 +61,58 @@ def _run_lama(model, img_bgr: np.ndarray, msk: np.ndarray) -> np.ndarray:
     return result
 
 
+def _seamless_blend(result_bgr: np.ndarray, image_bgr: np.ndarray,
+                    mask_u8: np.ndarray) -> np.ndarray:
+    """Per-component blend. Use Poisson seamlessClone ONLY when the surrounding
+    ring shows a real color gradient; for uniform (e.g. plain white bubble)
+    surroundings, keep LaMa's output as-is to avoid pulling outside colors in."""
+    H, W = image_bgr.shape[:2]
+    final = image_bgr.copy()
+    bin_mask = (mask_u8 > 127).astype(np.uint8) * 255
+    if bin_mask.sum() == 0:
+        return final
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
+    pad = 8
+    for i in range(1, num):
+        x, y, w, h, area = stats[i]
+        ys_all, xs_all = np.where(labels == i)
+        if area < 32:
+            final[ys_all, xs_all] = result_bgr[ys_all, xs_all]
+            continue
+        x0 = max(0, x - pad); y0 = max(0, y - pad)
+        x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
+        comp_mask = ((labels[y0:y1, x0:x1] == i).astype(np.uint8)) * 255
+        if comp_mask.shape[0] < 4 or comp_mask.shape[1] < 4:
+            final[ys_all, xs_all] = result_bgr[ys_all, xs_all]
+            continue
+        # Sample the ring just OUTSIDE the component to test for a gradient.
+        ring_outer = cv2.dilate(comp_mask, np.ones((9, 9), np.uint8))
+        ring_inner = cv2.dilate(comp_mask, np.ones((3, 3), np.uint8))
+        ring = (ring_outer > 0) & (ring_inner == 0)
+        roi = image_bgr[y0:y1, x0:x1]
+        if ring.sum() < 20:
+            final[ys_all, xs_all] = result_bgr[ys_all, xs_all]
+            continue
+        ring_pixels = roi[ring]
+        # Per-channel std across the ring; if low → background is uniform → no Poisson.
+        ring_std = float(ring_pixels.astype(np.float32).std(axis=0).mean())
+        if ring_std < 8.0:
+            final[ys_all, xs_all] = result_bgr[ys_all, xs_all]
+            continue
+        src = result_bgr[y0:y1, x0:x1]
+        dst = final[y0:y1, x0:x1]
+        cx = (x1 - x0) // 2
+        cy = (y1 - y0) // 2
+        try:
+            blended = cv2.seamlessClone(src, dst, comp_mask, (cx, cy), cv2.NORMAL_CLONE)
+            sel = comp_mask > 0
+            final[y0:y1, x0:x1][sel] = blended[sel]
+        except cv2.error:
+            sel = comp_mask > 0
+            final[y0:y1, x0:x1][sel] = src[sel]
+    return final
+
+
 @torch.no_grad()
 def lama_inpaint(image_bgr: np.ndarray, mask_gray: np.ndarray) -> np.ndarray:
     model = get_lama_model()
@@ -80,13 +132,15 @@ def lama_inpaint(image_bgr: np.ndarray, mask_gray: np.ndarray) -> np.ndarray:
         small_result = _run_lama(model, small_img, small_mask)
         result = cv2.resize(small_result, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
 
+    blended = _seamless_blend(result, image_bgr, expanded_mask)
+
     feather_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    feather = cv2.dilate(expanded_mask, feather_kernel, iterations=2)
+    feather = cv2.dilate(expanded_mask, feather_kernel, iterations=1)
     feather = cv2.GaussianBlur(feather, (11, 11), 3.0)
     feather_f = feather.astype(np.float32) / 255.0
     mask_3 = np.stack([feather_f] * 3, axis=-1)
 
-    final = (result * mask_3 + image_bgr * (1 - mask_3)).astype(np.uint8)
+    final = (blended * mask_3 + image_bgr * (1 - mask_3)).astype(np.uint8)
     return final
 
 
