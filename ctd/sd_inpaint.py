@@ -61,10 +61,16 @@ def _ensure_sd_checkpoint() -> str:
 
 
 SD_TRAIN_RES = 512
-SD_NUM_STEPS = 25
-SD_GUIDANCE = 7.5
-SD_PROMPT = "clean manga background, no text, plain artwork, consistent style"
-SD_NEG_PROMPT = "text, letters, words, writing, watermark, logo, signature, blurry, low quality"
+SD_NUM_STEPS = 30
+SD_GUIDANCE = 1.5
+SD_PROMPT = "seamless background continuation, empty, plain, smooth, uniform"
+SD_NEG_PROMPT = (
+    "person, people, character, man, woman, boy, girl, child, "
+    "face, eyes, mouth, nose, ears, hair, hands, fingers, body, figure, silhouette, "
+    "anime character, manga character, portrait, drawing of a person, "
+    "text, letters, words, writing, speech bubble, watermark, logo, signature, "
+    "new objects, new content, decoration, pattern, blurry, low quality, artifacts"
+)
 
 _sd_pipe = None
 
