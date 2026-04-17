@@ -44,24 +44,49 @@ MIN_DIFF_FROM_ORIG = 12.0  # below this → cleaning didn't change much → regr
 MAX_DRIFT_FROM_REF = 35.0  # above this → drifted from the known-good clean
 
 
-def _extract_fixture():
+def _ensure_fixture_extracted() -> bool:
+    """Prefer already-extracted fixture; fall back to zip extraction. Returns True if usable."""
     if FIXTURE_DIR.exists() and any(FIXTURE_DIR.glob("patch_*_orig.jpg")):
-        return
+        return True
+    if not FIXTURE_ZIP.exists():
+        return False
     FIXTURE_DIR.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(FIXTURE_ZIP) as zf:
         zf.extractall(FIXTURE_DIR.parent)
+    return any(FIXTURE_DIR.glob("patch_*_orig.jpg"))
 
 
 def _patch_ids():
-    if not FIXTURE_ZIP.exists():
+    if not _ensure_fixture_extracted():
         return []
-    _extract_fixture()
     ids = sorted({
         p.name.split("_")[1]
         for p in FIXTURE_DIR.glob("patch_*_orig.jpg")
     })
     limit = int(os.environ.get("LAMA_REGRESSION_LIMIT", "0") or 0)
     return ids if limit <= 0 else ids[:limit]
+
+
+def test_fixture_discovered():
+    """Guard: catch silent no-op runs where the fixture is missing."""
+    if os.environ.get("LAMA_REGRESSION_SKIP") == "1":
+        pytest.skip("LAMA_REGRESSION_SKIP=1")
+    if not FIXTURE_DIR.exists() and not FIXTURE_ZIP.exists():
+        pytest.skip("no fixture available in this environment")
+    ids = _patch_ids()
+    assert len(ids) > 0, (
+        f"No patches discovered in {FIXTURE_DIR} (and zip {FIXTURE_ZIP} did not extract). "
+        "Regression test would silently no-op."
+    )
+
+
+_clean_cache: dict[str, np.ndarray] = {}
+
+
+def _cleaned(lama_fn, pid: str, orig: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    if pid not in _clean_cache:
+        _clean_cache[pid] = lama_fn(orig, mask)
+    return _clean_cache[pid]
 
 
 pytestmark = pytest.mark.skipif(
@@ -101,7 +126,7 @@ def _masked_mean_abs_diff(a: np.ndarray, b: np.ndarray, mask: np.ndarray) -> flo
 @pytest.mark.parametrize("pid", _patch_ids())
 def test_clean_diverges_from_original(lama, pid):
     orig, mask, _ref = _load(pid)
-    cleaned = lama(orig, mask)
+    cleaned = _cleaned(lama, pid, orig, mask)
     diff = _masked_mean_abs_diff(cleaned, orig, mask)
     assert diff >= MIN_DIFF_FROM_ORIG, (
         f"patch {pid}: cleaned region too similar to original "
@@ -113,7 +138,7 @@ def test_clean_diverges_from_original(lama, pid):
 @pytest.mark.parametrize("pid", _patch_ids())
 def test_clean_stays_close_to_reference(lama, pid):
     orig, mask, ref = _load(pid)
-    cleaned = lama(orig, mask)
+    cleaned = _cleaned(lama, pid, orig, mask)
     drift = _masked_mean_abs_diff(cleaned, ref, mask)
     assert drift <= MAX_DRIFT_FROM_REF, (
         f"patch {pid}: cleaned region drifted from known-good reference "
