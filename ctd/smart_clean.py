@@ -5,8 +5,8 @@ from typing import List, Tuple, Optional
 
 logger = logging.getLogger(__name__)
 
-MASK_DILATE_SIZE = 7
-MASK_DILATE_ITER = 3
+MASK_DILATE_SIZE = 3
+MASK_DILATE_ITER = 2
 BUBBLE_STD_THRESHOLD = 40.0
 BUBBLE_BG_RATIO_MIN = 0.25
 
