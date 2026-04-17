@@ -61,16 +61,26 @@ def _run_lama(model, img_bgr: np.ndarray, msk: np.ndarray) -> np.ndarray:
     return result
 
 
-def _seamless_blend(result_bgr: np.ndarray, image_bgr: np.ndarray,
+def _gradient_blend(result_bgr: np.ndarray, image_bgr: np.ndarray,
                     mask_u8: np.ndarray) -> np.ndarray:
-    """Per-component blend. Use Poisson seamlessClone ONLY when the surrounding
-    ring shows a real color gradient; for uniform (e.g. plain white bubble)
-    surroundings, keep LaMa's output as-is to avoid pulling outside colors in."""
+    """Per-component smooth blend that NEVER reads in-mask (text) pixels.
+
+    For components whose surrounding ring shows a real color gradient, replace
+    LaMa's flat patch with: cv2.inpaint(NS) of the original (a smooth color
+    field interpolated from pixels OUTSIDE the dilated mask only) plus LaMa's
+    residual high-frequency texture. For uniform/plain bubbles, keep LaMa
+    output as-is. Because cv2.inpaint reads only unmasked pixels, no original
+    text can leak back into the cleaned region."""
     H, W = image_bgr.shape[:2]
     final = image_bgr.copy()
     bin_mask = (mask_u8 > 127).astype(np.uint8) * 255
     if bin_mask.sum() == 0:
         return final
+
+    # Smooth color field interpolated ONLY from pixels outside the dilated mask.
+    # Computed once per call; cheap relative to LaMa.
+    bg_field = cv2.inpaint(image_bgr, bin_mask, 5, cv2.INPAINT_NS)
+
     num, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
     pad = 8
     for i in range(1, num):
@@ -89,27 +99,29 @@ def _seamless_blend(result_bgr: np.ndarray, image_bgr: np.ndarray,
         ring_outer = cv2.dilate(comp_mask, np.ones((9, 9), np.uint8))
         ring_inner = cv2.dilate(comp_mask, np.ones((3, 3), np.uint8))
         ring = (ring_outer > 0) & (ring_inner == 0)
-        roi = image_bgr[y0:y1, x0:x1]
+        roi_orig = image_bgr[y0:y1, x0:x1]
         if ring.sum() < 20:
             final[ys_all, xs_all] = result_bgr[ys_all, xs_all]
             continue
-        ring_pixels = roi[ring]
-        # Per-channel std across the ring; if low → background is uniform → no Poisson.
-        ring_std = float(ring_pixels.astype(np.float32).std(axis=0).mean())
+        ring_std = float(roi_orig[ring].astype(np.float32).std(axis=0).mean())
         if ring_std < 8.0:
             final[ys_all, xs_all] = result_bgr[ys_all, xs_all]
             continue
-        src = result_bgr[y0:y1, x0:x1]
-        dst = final[y0:y1, x0:x1]
-        cx = (x1 - x0) // 2
-        cy = (y1 - y0) // 2
-        try:
-            blended = cv2.seamlessClone(src, dst, comp_mask, (cx, cy), cv2.NORMAL_CLONE)
-            sel = comp_mask > 0
-            final[y0:y1, x0:x1][sel] = blended[sel]
-        except cv2.error:
-            sel = comp_mask > 0
-            final[y0:y1, x0:x1][sel] = src[sel]
+
+        # Combine smooth external gradient (bg_field) with LaMa's high-freq
+        # residual to keep any subtle texture LaMa produced. Sigma scales with
+        # component size so the low-frequency split matches the bubble.
+        roi_lama = result_bgr[y0:y1, x0:x1].astype(np.float32)
+        roi_bg = bg_field[y0:y1, x0:x1].astype(np.float32)
+        size = max(w, h)
+        sigma = max(3.0, size / 4.0)
+        k = int(sigma * 4) | 1
+        k = max(3, min(k, 51))
+        lama_low = cv2.GaussianBlur(roi_lama, (k, k), sigma)
+        merged = roi_bg + (roi_lama - lama_low)
+        merged = np.clip(merged, 0, 255).astype(np.uint8)
+        sel = comp_mask > 0
+        final[y0:y1, x0:x1][sel] = merged[sel]
     return final
 
 
@@ -132,7 +144,7 @@ def lama_inpaint(image_bgr: np.ndarray, mask_gray: np.ndarray) -> np.ndarray:
         small_result = _run_lama(model, small_img, small_mask)
         result = cv2.resize(small_result, (orig_w, orig_h), interpolation=cv2.INTER_CUBIC)
 
-    blended = _seamless_blend(result, image_bgr, expanded_mask)
+    blended = _gradient_blend(result, image_bgr, expanded_mask)
 
     feather_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     feather = cv2.dilate(expanded_mask, feather_kernel, iterations=1)
