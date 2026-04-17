@@ -53,11 +53,13 @@ _lama_model = None
 
 
 def get_detector():
+    """Lazy-init the comictextdetector ONNX session (downloads model on first call)."""
     global _detector
     if _detector is None:
-        from ctd import ComicTextDetector
-        _detector = ComicTextDetector.get_instance(device=DEVICE)
-        logger.info(f"CTD loaded on {DEVICE}")
+        from ctd.ctd_onnx_detector import warmup
+        warmup()
+        _detector = True  # session lives inside ctd_onnx_detector module
+        logger.info("CTD-ONNX detector ready")
     return _detector
 
 
@@ -198,129 +200,89 @@ def _overlay_mask(image_bgr: np.ndarray, mask: np.ndarray, color=(0, 255, 0), al
     return out
 
 
-def _collect_debug_stage(debug_files: list, image_bgr, raw_mask, enhanced_mask, inpaint_mask, blk_list):
+def _collect_debug_stage(debug_files: list, image_bgr, raw_mask, enhanced_mask, inpaint_mask):
     debug_files.append(("01_raw_mask.jpg", _encode_debug_jpg(raw_mask)))
     debug_files.append(("02_enhanced_mask.jpg", _encode_debug_jpg(enhanced_mask)))
     debug_files.append(("03_inpaint_mask.jpg", _encode_debug_jpg(inpaint_mask)))
-    overlay_boxes = _overlay_mask(image_bgr, raw_mask, color=(0, 255, 0), alpha=0.45)
-    for b in blk_list:
-        x1, y1, x2, y2 = b.xyxy
-        cv2.rectangle(overlay_boxes, (x1, y1), (x2, y2), (0, 0, 255), 2)
-    debug_files.append(("04_raw_overlay.jpg", _encode_debug_jpg(overlay_boxes)))
+    debug_files.append(("04_raw_overlay.jpg", _encode_debug_jpg(_overlay_mask(image_bgr, raw_mask, color=(0, 255, 0), alpha=0.45))))
     debug_files.append(("05_enhanced_overlay.jpg", _encode_debug_jpg(_overlay_mask(image_bgr, enhanced_mask, color=(255, 128, 0), alpha=0.5))))
     debug_files.append(("06_inpaint_overlay.jpg", _encode_debug_jpg(_overlay_mask(image_bgr, inpaint_mask, color=(255, 0, 255), alpha=0.5))))
 
 
-def _run_inpaint_engine(patch, engine, debug_files, patch_idx):
-    img = patch['image']
-    msk = patch['mask']
-
-    if engine == 'lama':
-        return lama_inpaint_gpu(img, msk)
-
+def _inpaint_with_engine(image_bgr, mask, engine, debug_files):
+    """Run the chosen inpaint engine on the full image+mask."""
     if engine == 'sd':
         from ctd.sd_inpaint import sd_inpaint
         try:
-            return sd_inpaint(img, msk, device=DEVICE)
+            return sd_inpaint(image_bgr, mask, device=DEVICE)
         except Exception as e:
-            logger.error(f"SD inpaint failed on patch {patch_idx}: {e}", exc_info=True)
-            return lama_inpaint_gpu(img, msk)
+            logger.error(f"SD inpaint failed, falling back to LaMa: {e}", exc_info=True)
+            return lama_inpaint_gpu(image_bgr, mask)
 
     if engine == 'compare':
-        lama_out = lama_inpaint_gpu(img, msk)
-        sd_out = None
+        lama_out = lama_inpaint_gpu(image_bgr, mask)
         try:
             from ctd.sd_inpaint import sd_inpaint
-            sd_out = sd_inpaint(img, msk, device=DEVICE)
+            sd_out = sd_inpaint(image_bgr, mask, device=DEVICE)
         except Exception as e:
-            logger.error(f"SD inpaint failed on patch {patch_idx}: {e}", exc_info=True)
+            logger.error(f"SD inpaint failed: {e}", exc_info=True)
+            sd_out = None
         if debug_files is not None:
-            debug_files.append((f"comparison/patch_{patch_idx:03d}_orig.jpg", _encode_debug_jpg(img)))
-            debug_files.append((f"comparison/patch_{patch_idx:03d}_mask.jpg", _encode_debug_jpg(msk)))
-            debug_files.append((f"comparison/patch_{patch_idx:03d}_lama.jpg", _encode_debug_jpg(lama_out)))
+            debug_files.append(("compare_lama.jpg", _encode_debug_jpg(lama_out)))
             if sd_out is not None:
-                debug_files.append((f"comparison/patch_{patch_idx:03d}_sd.jpg", _encode_debug_jpg(sd_out)))
+                debug_files.append(("compare_sd.jpg", _encode_debug_jpg(sd_out)))
         return lama_out
 
-    return lama_inpaint_gpu(img, msk)
+    return lama_inpaint_gpu(image_bgr, mask)
+
+
+def _clean_region(region_bgr, debug_files=None, engine='lama'):
+    """Detect text → enhance with EasyOCR → inpaint. Returns (cleaned, raw_mask, enh_mask)."""
+    from ctd.ctd_onnx_detector import detect_text_mask
+    from ctd.easyocr_enhancer import enhance_mask_with_easyocr
+
+    raw_mask, _ = detect_text_mask(region_bgr)
+    text_mask = raw_mask
+    try:
+        text_mask = enhance_mask_with_easyocr(region_bgr, raw_mask)
+    except Exception as e:
+        logger.warning(f"EasyOCR enhance failed: {e}")
+
+    if np.sum(text_mask > 127) == 0:
+        return region_bgr, raw_mask, text_mask
+
+    cleaned = _inpaint_with_engine(region_bgr, text_mask, engine, debug_files)
+    return cleaned, raw_mask, text_mask
 
 
 def clean_image_gpu(image_bgr, debug_files=None, engine='lama'):
-    from ctd.smart_clean import smart_clean, extract_inpaint_patches, apply_inpainted_patches
-    from ctd.easyocr_enhancer import enhance_mask_with_easyocr
-
-    detector = get_detector()
+    get_detector()  # ensure model is warm
     h, w = image_bgr.shape[:2]
 
     if h <= CHUNK_MAX_HEIGHT:
-        raw_text_mask, blk_list = detector.detect_for_cleaning(image_bgr, dilate_size=5, dilate_iter=2)
-        text_mask = raw_text_mask
-        try:
-            text_mask = enhance_mask_with_easyocr(image_bgr, raw_text_mask)
-        except Exception as e:
-            logger.warning(f"EasyOCR enhance failed: {e}")
-        if not blk_list and np.sum(text_mask > 127) == 0:
-            if debug_files is not None:
-                empty = np.zeros((h, w), dtype=np.uint8)
-                _collect_debug_stage(debug_files, image_bgr, raw_text_mask, text_mask, empty, [])
-            return image_bgr
-        boxes = [tuple(b.xyxy) for b in blk_list]
-        result, inpaint_mask, bubble_filled = smart_clean(image_bgr, text_mask, boxes)
+        result, raw_mask, enh_mask = _clean_region(image_bgr, debug_files, engine)
         if debug_files is not None:
-            _collect_debug_stage(debug_files, image_bgr, raw_text_mask, text_mask, inpaint_mask, blk_list)
-        patches = extract_inpaint_patches(result, inpaint_mask, padding=60)
-        if patches:
-            inpainted = [_run_inpaint_engine(p, engine, debug_files, i) for i, p in enumerate(patches)]
-            result = apply_inpainted_patches(result, patches, inpainted)
+            _collect_debug_stage(debug_files, image_bgr, raw_mask, enh_mask, enh_mask)
         return result
 
     chunks = _find_smart_split_points(image_bgr)
     logger.info(f"Split {w}x{h} → {len(chunks)} chunks")
     result = image_bgr.copy()
 
-    full_raw_mask = np.zeros((h, w), dtype=np.uint8) if debug_files is not None else None
-    full_enh_mask = np.zeros((h, w), dtype=np.uint8) if debug_files is not None else None
-    full_inpaint_mask = np.zeros((h, w), dtype=np.uint8) if debug_files is not None else None
-    all_blks = [] if debug_files is not None else None
+    full_raw = np.zeros((h, w), dtype=np.uint8) if debug_files is not None else None
+    full_enh = np.zeros((h, w), dtype=np.uint8) if debug_files is not None else None
 
-    for chunk_idx, (chunk_start, chunk_end) in enumerate(chunks):
-        chunk_img = result[chunk_start:chunk_end, :, :].copy()
-        raw_text_mask, blk_list = detector.detect_for_cleaning(chunk_img, dilate_size=5, dilate_iter=2)
-        text_mask = raw_text_mask
-        try:
-            text_mask = enhance_mask_with_easyocr(chunk_img, raw_text_mask)
-        except Exception as e:
-            logger.warning(f"EasyOCR enhance failed on chunk {chunk_idx+1}: {e}")
-
-        if not blk_list and np.sum(text_mask > 127) == 0:
-            continue
-
-        boxes = [tuple(b.xyxy) for b in blk_list]
-        cleaned, inpaint_mask, bubble_filled = smart_clean(chunk_img, text_mask, boxes)
-        result[chunk_start:chunk_end, :, :] = cleaned
-
+    for idx, (y0, y1) in enumerate(chunks):
+        chunk = result[y0:y1, :, :].copy()
+        cleaned, raw_mask, enh_mask = _clean_region(chunk, debug_files, engine)
+        result[y0:y1, :, :] = cleaned
         if debug_files is not None:
-            full_raw_mask[chunk_start:chunk_end, :] = np.maximum(full_raw_mask[chunk_start:chunk_end, :], raw_text_mask)
-            full_enh_mask[chunk_start:chunk_end, :] = np.maximum(full_enh_mask[chunk_start:chunk_end, :], text_mask)
-            full_inpaint_mask[chunk_start:chunk_end, :] = np.maximum(full_inpaint_mask[chunk_start:chunk_end, :], inpaint_mask)
-            for b in blk_list:
-                bx1, by1, bx2, by2 = b.xyxy
-                shifted = type(b)([bx1, by1 + chunk_start, bx2, by2 + chunk_start], cls_name=b.cls_name)
-                all_blks.append(shifted)
+            full_raw[y0:y1, :] = np.maximum(full_raw[y0:y1, :], raw_mask)
+            full_enh[y0:y1, :] = np.maximum(full_enh[y0:y1, :], enh_mask)
+        logger.info(f"Chunk {idx+1}/{len(chunks)}: {int((enh_mask > 127).sum())} text px ({engine})")
 
-        patches = extract_inpaint_patches(cleaned, inpaint_mask, padding=60)
-        if patches:
-            for p in patches:
-                px1, py1, px2, py2 = p['position']
-                p['position'] = (px1, py1 + chunk_start, px2, py2 + chunk_start)
-                p['image'] = result[py1 + chunk_start:py2 + chunk_start, px1:px2].copy()
-
-            inpainted = [_run_inpaint_engine(p, engine, debug_files, chunk_idx * 100 + i) for i, p in enumerate(patches)]
-            result = apply_inpainted_patches(result, patches, inpainted)
-            logger.info(f"Chunk {chunk_idx+1}/{len(chunks)}: {len(boxes)} text → {len(patches)} patches inpainted ({engine})")
-
-    if debug_files is not None and full_raw_mask is not None:
-        _collect_debug_stage(debug_files, image_bgr, full_raw_mask, full_enh_mask, full_inpaint_mask, all_blks)
+    if debug_files is not None and full_raw is not None:
+        _collect_debug_stage(debug_files, image_bgr, full_raw, full_enh, full_enh)
 
     return result
 
